@@ -31,6 +31,10 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import {
+  legacyAliasesWithEmptyFingerprint,
+  relabelLegacyVectors,
+} from "./legacy-embed-adoption.js";
 import type {
   NamedCollection,
   Collection,
@@ -2152,11 +2156,28 @@ export type LegacyFingerprintAdoptionResult = {
   reason: string;
 };
 
-export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
+/**
+ * Verify-and-adopt orphaned empty-fingerprint vectors stored under a single
+ * candidate `legacyModel`, relabeling them onto the current (model, fingerprint)
+ * pair if — and only if — a re-embedded sample reproduces the stored vector
+ * within a tight cosine-distance threshold.
+ *
+ * `legacyModel` may equal `model` (the original same-model empty-fingerprint
+ * case) or be a historical alias of it (e.g. "embeddinggemma" before the embed
+ * model URI was fully qualified). Either way the sample is embedded with the
+ * CURRENT model so the check confirms the current pipeline reproduces the
+ * legacy vector before any relabel happens. Fails safe: any mismatch, missing
+ * sample, or absent vector table aborts with adopted === 0.
+ */
+async function adoptLegacyModelCandidate(
+  store: Store,
+  model: string,
+  fingerprint: string,
+  legacyModel: string,
+): Promise<LegacyFingerprintAdoptionResult> {
   const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
   const legacyCount = withLazyContentVectorMigration(db, () => {
-    const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
+    const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(legacyModel) as { count: number };
     return row.count;
   });
   if (legacyCount === 0) {
@@ -2172,7 +2193,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
     GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
     ORDER BY cv.hash, cv.seq
     LIMIT 1
-  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
+  `).get(legacyModel) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
 
   if (!sample) {
     return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
@@ -2214,9 +2235,33 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
       return { checked: true, adopted: 0, reason: `legacy sample differs from current fingerprint (nearest ${nearest.hash_seq}, distance ${nearest.distance.toFixed(6)})` };
     }
 
-    const update = withLazyContentVectorMigration(db, () => db.prepare(`UPDATE content_vectors SET embed_fingerprint = ? WHERE model = ? AND embed_fingerprint = ''`).run(fingerprint, model));
-    return { checked: true, adopted: update.changes, reason: `sample ${expectedHashSeq} matched current fingerprint at distance ${nearest.distance.toFixed(6)}` };
+    // Sample reproduced: safe to relabel every orphaned row of this candidate
+    // onto the current (model, fingerprint) pair without recomputing.
+    const adopted = withLazyContentVectorMigration(db, () => relabelLegacyVectors(db, legacyModel, model, fingerprint));
+    const via = legacyModel === model ? "" : ` (model alias '${legacyModel}')`;
+    return { checked: true, adopted, reason: `sample ${expectedHashSeq} matched current fingerprint at distance ${nearest.distance.toFixed(6)}${via}` };
   });
+}
+
+export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
+  const fingerprint = getEmbeddingFingerprint(model);
+
+  // Try the current model's own empty-fingerprint rows first (original
+  // behavior), then any historical model aliases that currently have orphaned
+  // rows. A model rename (short "embeddinggemma" → fully-qualified HF URI) would
+  // otherwise orphan an entire corpus and force a multi-hour re-embed.
+  const candidates = [model, ...legacyAliasesWithEmptyFingerprint(store.db, model)];
+
+  // Default reason mirrors the original no-op return. We keep the most useful
+  // reason seen: a "checked" attempt (LLM verification ran) outranks a plain
+  // "no rows" result.
+  let lastResult: LegacyFingerprintAdoptionResult = { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
+  for (const legacyModel of candidates) {
+    const result = await adoptLegacyModelCandidate(store, model, fingerprint, legacyModel);
+    if (result.adopted > 0) return result;
+    if (result.checked && !lastResult.checked) lastResult = result;
+  }
+  return lastResult;
 }
 
 export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {

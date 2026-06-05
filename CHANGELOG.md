@@ -50,6 +50,21 @@
   `QMD_EMBED_MAX_DURATION_MS` (default: 30 min). This prevents large-corpus
   embeddings from being aborted by the hardcoded 30-minute ceiling (#673).
 
+
+### Rob's Fixes
+
+- `qmd doctor` now adopts (relabels) legacy embedding vectors stored under the
+  old short model name `embeddinggemma` — not just empty-fingerprint rows under
+  the current model URI. When the default embed model URI was fully qualified to
+  `hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf`, an entire
+  previously-embedded corpus was orphaned and re-read as "pending", forcing a
+  full multi-hour re-embed. Adoption re-embeds one sample, confirms it reproduces
+  the stored vector within a tight cosine-distance threshold, then relabels every
+  matching chunk in place without recomputing. Fails safe: any mismatch leaves
+  the legacy vectors untouched and the re-embed proceeds. The model-alias map and
+  the pure relabel/detection helpers live in the new `src/legacy-embed-adoption.ts`
+  module.
+
 ## [2.5.3] - 2026-05-28
 
 ### Features
