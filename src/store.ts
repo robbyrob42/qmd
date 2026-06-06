@@ -1577,6 +1577,21 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
 }
 
 /**
+ * Resolve the embedding session's max-duration watchdog (ms).
+ *
+ * A bulk embed run over a large corpus can legitimately take hours. The session
+ * previously hard-capped at 30 minutes, so any large run self-aborted mid-flight
+ * and stranded every remaining chunk as a "session expired" failure. We default
+ * to 0 (no watchdog — the run completes or the user interrupts it). Set
+ * QMD_EMBED_MAX_DURATION_MS to a positive value to re-arm a watchdog (e.g. for
+ * unattended jobs that should bail if the model hangs). 0 disables the timer.
+ */
+function resolveEmbedMaxDurationMs(): number {
+  const v = parseInt(process.env.QMD_EMBED_MAX_DURATION_MS ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+/**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
  * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
@@ -1831,7 +1846,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: resolveEmbedMaxDurationMs(), name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
