@@ -205,3 +205,56 @@ returns subchunks that don't shrink and the fallback clamp doesn't engage as exp
 **Decision already made:** do NOT stop the current run for this. It reproduces the
 known-good quality of the prior corpus; the proper fix is a deliberate, separate
 rebuild.
+
+## Vector storage model & collection management (verified 2026-06-11)
+
+**Vectors are keyed by document CONTENT, not by collection.** Relevant schema
+(`src/store.ts`):
+
+```
+content        (hash PRIMARY KEY, doc, ...)                 -- doc body, keyed by content hash
+documents      (id, collection, path, title, hash, active,  -- maps a file to a content hash
+                FOREIGN KEY(hash) REFERENCES content(hash) ON DELETE CASCADE,
+                UNIQUE(collection, path))
+content_vectors(hash, seq, pos, model, embed_fingerprint,   -- the vectors
+                total_chunks, embedded_at,
+                PRIMARY KEY (hash, seq))                     -- NO collection column
+vectors_vec    (hash_seq, embedding)                        -- sqlite-vec ANN index
+```
+
+The embedding input is `formatDocForEmbedding` = `title: {title} | text: {text}`
+(`src/llm.ts`) — it contains **no collection, path, or context**. So collection
+structure never affects a vector's value. A vector survives as long as **any active
+document references its hash**.
+
+**Consequence — reorganizing collections is a REMAP, not a re-embed**, provided file
+content is unchanged and no hash gets orphaned. Three rules:
+
+1. **Rename = free/instant.** `renameCollection` (store.ts:3133) does
+   `UPDATE documents SET collection=…`; vectors untouched.
+2. **Re-point same files into new collections = no re-embed**, but mind the gap:
+   `removeCollection` (store.ts:3110) does `DELETE FROM documents WHERE collection=?`
+   then deletes orphaned `content` rows; a later re-index also prunes orphaned
+   `content_vectors` (store.ts:2407, `WHERE hash NOT IN (active documents)`). If the
+   removal orphans a hash (no other active doc references it), its vectors are
+   garbage-collected → re-adding re-embeds.
+3. **Re-embed only on real content change.** A new content hash (file edited), or a
+   changed `(model, embed_fingerprint)`. A file **move/rename is not a content change**
+   → same hash → vectors reused.
+
+**Safe split procedure (e.g. break one umbrella collection into topic collections):**
+keep every file continuously referenced so nothing orphans —
+1. **Add** the new granular collections (over the same files/subfolders) **first**.
+2. **Then remove** the umbrella collection. Hashes stay referenced → vectors survive.
+   Avoid the naive remove-then-add, which opens an orphaning window.
+3. Physically moving files into topic folders is fine (move ≠ edit); index the new
+   locations, same content → same hash → reused vectors.
+
+**Caveat:** for docs with **no H1** (title falls back to the path basename), a
+move/rename changes what the title *would* be, but the existing vector keeps the
+old-path title (reused, not recomputed). Minor, and only for no-H1 docs. Force-refresh
+only via a full `qmd embed --force`.
+
+**Timing:** do collection reorganization **after** the current rebuild finishes and
+`qmd doctor` is green — reorganizing mid-run re-indexes and can trigger the orphan
+cleanups while `qmd embed` is writing.
