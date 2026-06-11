@@ -151,7 +151,7 @@ they don't fire and protect the index when they do.
   repo binary; `dist/` was built 2026-06-10 19:41 from this branch (contains the
   perf fixes + the 900-token-cap chunker), so it reflects current source.
 
-## Open investigation: "Batch text truncated to fit embedding context (2048 tokens)" flood
+## RESOLVED: "Batch text truncated to fit embedding context (2048 tokens)" flood — a single giant-title doc
 
 **Symptom:** during the run, a bounded region of ~20–30k chunks flooded this warning
 (~1 per chunk), then stopped — a contiguous *cluster of documents*, not corpus-wide.
@@ -182,29 +182,37 @@ i.e. the prior working corpus had the same behavior.
   defeating its own cap. Random sampling missed the cluster (localized ~hundreds of docs
   in 17k).
 
-**Hypothesis to confirm:** a specific markdown structure defeats the recursive
-token-split — most likely a near-unsplittable token-dense span where `chunkDocument`
-returns subchunks that don't shrink and the fallback clamp doesn't engage as expected.
+**Root cause (confirmed by full-corpus scan, 2026-06-11).** Re-tokenizing every
+near-cap chunk across all 17,239 docs found **exactly 1 offender doc, 1,159 chunks**:
 
-**Next steps (pick up here after context clear):**
-1. Read the full-corpus cap-failure scan result. It was launched as a background Bash:
-   script `probe-cap-fail.ts`, task id `b1nag178b`, output at
-   `/private/tmp/claude-501/.../tasks/b1nag178b.output` (re-run the script if the temp
-   file is gone — it's read-only, ~10–15 min, model = tokenizer only). It lists every
-   doc with a chunk whose `chunk.tokens > 900`, worst-first.
-2. Open ONE named offender, find the markdown span that produces the oversize chunk,
-   and trace why `pushChunkWithinTokenLimit` (store.ts:2741) fails to clamp it to 900.
-3. Fix is **fork-side, fingerprint-changing** (so bundle into a future final rebuild,
-   not the current run): either fix the re-split/fallback so no chunk exceeds 900, or
-   add a hard pre-embed token clamp at chunk time. Also consider clamping `title` length
-   in `formatDocForEmbedding`/`extractTitle` (kills the 1 giant-title doc cheaply).
-4. Throwaway probe scripts left in repo root (untracked, safe to delete after the scan):
-   `probe-cap-fail.ts`, `probe-chunk-tokenlen.ts`, `probe-title-len.ts`, `caperr.log`,
-   `err2.log`. They all open `createStore($HOME/.cache/qmd/index.sqlite)` read-only.
+```
+reportedTok -> reText -> reFormatted | nOver/total
+   899      ->   899   ->   4835     | 1159/1159   Electric-furnace-steel-making-...WeLib-org-c8c20930.md
+```
 
-**Decision already made:** do NOT stop the current run for this. It reproduces the
-known-good quality of the prior corpus; the proper fix is a deliberate, separate
-rebuild.
+- `chunk.text` = **899 tokens** (chunker is fine — cap holds), and re-tokenizes to the
+  same 899 (so the detokenize-expansion theory was **wrong** — no expansion).
+- The formatted embed input is **4,835 tokens**. The gap (4835 − 899 ≈ **3,936**) is the
+  **title**: this one ebook (a PDF→markdown conversion) has a **10,177-char first
+  heading line**, which `extractTitle`'s `/^##?\s+(.+)$/m` captures whole (~3,934 tokens).
+- `formatDocForEmbedding` puts `title:` **first**, so the title alone exceeds the 2,048
+  budget and **the body is truncated away on every one of the book's 1,159 chunks** —
+  all 1,159 vectors collapse to ~the same truncated-title vector.
+
+So the entire flood was **one malformed document**, not a chunker bug and not a
+widespread pattern. Corpus impact: 1,159 / ~1.9M chunks ≈ **0.06%**. The 900-token chunk
+cap is correct everywhere; `truncateToContextSize` did its job (prevented a GGML crash).
+
+**Fix (fork-side, fingerprint-changing → bundle into a future deliberate rebuild, not
+the current run):** clamp the title before it reaches the embedding. Minimal change in
+`formatDocForEmbedding` (`src/llm.ts`) — cap `title` to e.g. ~256 chars / ~80 tokens; a
+title is metadata and must never dominate the chunk body. (Alternative data fix for just
+this file: repair its giant first-heading line and re-index → re-embed that one doc.)
+Either changes the embedding for affected docs, hence fingerprint-changing.
+
+**Decision (stands):** the current run was correctly left running. It reproduces the
+known-good behavior of the prior corpus; the title clamp is a deliberate improvement for
+the next rebuild, bundled with the chunk-size reconsideration above.
 
 ## Vector storage model & collection management (verified 2026-06-11)
 
