@@ -242,6 +242,21 @@ content is unchanged and no hash gets orphaned. Three rules:
    changed `(model, embed_fingerprint)`. A file **move/rename is not a content change**
    → same hash → vectors reused.
 
+**Collections can overlap — one document can live in many collections, sharing a
+single vector.** `documents` is `UNIQUE(collection, path)` (the *pair*), so the same
+`path`/content can appear under multiple collection names, and the same `hash` can be
+referenced by many `documents` rows. Because vectors are keyed by `hash`, **all of
+those references share one set of vectors — the content is embedded exactly once**, no
+matter how many collections cover it. Two implications:
+- **Overlapping collections are cheap.** Pointing several collections at the same files
+  (e.g. a broad `all-notes` plus narrow topic collections over subsets) costs no extra
+  embedding — they reuse the shared hash-keyed vectors. Same for two *different* files
+  with byte-identical content: one hash, one vector (content-level dedup).
+- **Orphaning is across ALL collections.** A hash is pruned only when **no** active
+  `documents` row anywhere references it (`hash NOT IN (SELECT DISTINCT hash FROM
+  documents WHERE active = 1)`, store.ts:3117). So while a file is covered by even one
+  other collection, removing it from another never orphans its vectors.
+
 **Safe split procedure (e.g. break one umbrella collection into topic collections):**
 keep every file continuously referenced so nothing orphans —
 1. **Add** the new granular collections (over the same files/subfolders) **first**.
