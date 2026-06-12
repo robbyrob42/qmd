@@ -137,10 +137,15 @@ they don't fire and protect the index when they do.
 
 ## Run status & operational rules (2026-06-11)
 
-- The full re-embed is **in progress**, resumed as plain `qmd embed` (NOT `--force`).
-  At last check ~30% by input bytes, ~33 KB/s, ETA ~8–9h. GPU was pinned ~96–100%
-  (compute-bound — do not bother raising concurrency/batch; the 300M model on the
-  M1 Max is the ceiling). Cooling (off-desk VESA mount + barrel fan) holds clocks.
+- The full re-embed **COMPLETED 2026-06-11** (~13h total wall, ~33 KB/s steady, no
+  thermal throttle). `qmd doctor` is green: `embedding freshness: all active documents
+  match`, 17,239 docs on fingerprint `c37385`, `embedding vector sample` reproduces 3/3
+  (was 2/3 pre-rebuild — the deterministic-rebuild convergence predicted by the
+  `d_self=0` probe, confirmed). Final corpus: **1,515,408 vectors / 17,240 files /
+  11.7 GB** (fewer than the old ~1.7M legacy because the upstream chunking change yields
+  different boundaries — now uniform across the whole corpus). GPU was pinned ~96–100%
+  (compute-bound — the 300M model on the M1 Max is the ceiling; raising concurrency/batch
+  buys nothing). Cooling (off-desk VESA mount + barrel fan) held clocks.
 - **RESUME RULE (critical):** if the run stops (sleep/crash/Ctrl-C), restart with
   **plain `qmd embed`** — it skips already-written chunks and continues. **Never
   re-run `qmd embed --force`** to resume: `--force` calls `clearAllEmbeddings()`
