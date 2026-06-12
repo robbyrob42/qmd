@@ -219,6 +219,54 @@ Either changes the embedding for affected docs, hence fingerprint-changing.
 known-good behavior of the prior corpus; the title clamp is a deliberate improvement for
 the next rebuild, bundled with the chunk-size reconsideration above.
 
+## Pending fork work (defined, NOT yet implemented)
+
+### 1. Title clamp in `formatDocForEmbedding` (TODO)
+
+**Goal:** stop a pathologically long title (e.g. the 10,177-char heading on the
+Electric-furnace-steel-making ebook) from filling the 2,048-token embed budget and
+truncating the document body away. A title is metadata and must never dominate the chunk.
+
+**Change:** in `formatDocForEmbedding` (`src/llm.ts`), clamp `title` to a max length
+before composing the output, in BOTH the Qwen3 branch and the default
+`title: … | text: …` branch. Keep it **char-based** (the function is pure/sync — no
+tokenizer available). Suggested constant `EMBED_TITLE_MAX_CHARS = 256` (~64–85 tokens;
+leaves the full context for the body). Add a comment pointing back to this doc.
+
+**Fingerprint safety (verified 2026-06-11):** `getEmbeddingFingerprint` (store.ts:72–81)
+runs `formatDocForEmbedding` on `EMBED_FINGERPRINT_PROBE_TITLE =
+"__qmd_embedding_title_probe__"` (**29 chars**). A clamp threshold **> 29 chars** (e.g.
+256) leaves the probe output unchanged, so the fingerprint stays **`c37385`** and the
+current 1.5M-vector corpus is NOT invalidated — no forced re-embed. (A clamp threshold
+≤ the probe length WOULD change the fingerprint and strand the whole corpus — don't.)
+
+**Consequence to note:** because the fingerprint is preserved, the clamp does NOT
+auto-refresh the already-degraded steel-book vectors (they still match `c37385`, so
+they're "fresh"). The clamp benefits (a) any docs embedded *after* it ships, and (b) a
+future `--force` rebuild. To fix the steel book specifically without a full rebuild,
+re-embed just that doc (or repair its giant first-heading line in the source markdown,
+re-index, re-embed it). 0.06% of corpus — low priority.
+
+**Tests:** in `test/store.test.ts` → `describe("Embedding Formatting")` (~line 536) add:
+(a) a long title (> threshold) is truncated in the output; a short title is untouched;
+(b) `getEmbeddingFingerprint()` still returns `c37385` after the clamp exists (guards the
+fingerprint-safety invariant).
+
+### 2. Land the branch / optional upstream contribution
+
+Branch `fix/embed-legacy-adoption-and-throughput` is validated end-to-end (doctor green)
+and merge-ready on **our fork** (`origin` = robbyrob42/qmd). Remotes: `origin` = fork,
+`upstream` = tobi/qmd.
+
+- **Land on our fork (recommended, do this):** merge the branch → our `main`, push to
+  `origin`. Gets the validated fixes off the branch.
+- **Optional upstream PR to `tobi/qmd` (separate, curated):** only the generally-useful
+  code belongs — cherry-pick the perf commit `bc2db9a` (30-min self-abort removal +
+  concurrent `embedBatch` + `batchSize`) onto a fresh branch off `upstream/main`, plus
+  the title clamp once built. **Exclude** all fork-private content: `docs/FORK-*`, the
+  `CLAUDE.md` edits, and the legacy-`embeddinggemma` adoption (`a5fb0c3` — tailored to
+  our model-URI-rename history; upstream likely doesn't want the alias map).
+
 ## Vector storage model & collection management (verified 2026-06-11)
 
 **Vectors are keyed by document CONTENT, not by collection.** Relevant schema
