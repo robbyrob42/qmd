@@ -140,6 +140,19 @@ bun test --preload ./src/test-preload.ts test/
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
 
+## Embedding tuning (env vars)
+
+- `QMD_EMBED_MAX_DURATION_MS` — embed session watchdog in ms. Default `0`
+  (disabled, so bulk runs are not capped). Set positive to bail if the model hangs.
+- `QMD_EMBED_CONCURRENCY` — `getEmbeddingFor` calls in flight per embedding
+  context. Default `32`. Higher = more GPU batching, more memory.
+- `QMD_EMBED_BATCH_SIZE` — embedding context batch size (tokens). Default =
+  `QMD_EMBED_CONTEXT_SIZE` (2048).
+- Legacy vectors stored under the old `embeddinggemma` model name are adopted
+  (relabeled, not recomputed) by `qmd doctor` when a sample reproduces — avoids a
+  full re-embed after the model URI was fully qualified. See
+  `src/legacy-embed-adoption.ts`.
+
 ## Important: Do NOT run automatically
 
 - Never run `qmd collection add`, `qmd embed`, or `qmd update` automatically

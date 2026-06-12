@@ -21,6 +21,21 @@
   for running `git pull` before re-indexing is a per-collection `update` command,
   set via `qmd collection update-cmd`.
 
+### Performance
+
+- `qmd embed` no longer self-aborts after 30 minutes. The embedding session's
+  watchdog timer now defaults to disabled, so a large bulk run completes in one
+  pass instead of stranding the remaining chunks as "session expired" failures
+  every half hour. The watchdog is env-configurable via
+  `QMD_EMBED_MAX_DURATION_MS`; set it to a positive value to re-arm a watchdog
+  for unattended jobs (#673).
+- `embedBatch` now dispatches `getEmbeddingFor` in concurrent windows per
+  embedding context (instead of awaiting each call serially), letting
+  node-llama-cpp coalesce them into shared decode passes. Embedding contexts are
+  also created with an explicit `batchSize` (defaults to the context size).
+  Tunables: `QMD_EMBED_CONCURRENCY` (per-context in-flight calls, default 32) and
+  `QMD_EMBED_BATCH_SIZE` (context batch size in tokens, default = context size).
+
 ### Fixed
 
 - MCP server instructions now tell agents to scope with the plural `collections`
@@ -46,9 +61,17 @@
   URIs in the `file` field, matching the output format used by the CLI and MCP
   resource URIs. Previously the raw `displayPath` (`collection/path`) was
   returned without the scheme prefix (#576).
-- The embed session `maxDuration` is now env-configurable via
-  `QMD_EMBED_MAX_DURATION_MS` (default: 30 min). This prevents large-corpus
-  embeddings from being aborted by the hardcoded 30-minute ceiling (#673).
+- `qmd doctor` now adopts (relabels) legacy embedding vectors stored under the
+  old short model name `embeddinggemma` — not just empty-fingerprint rows under
+  the current model URI. When the default embed model URI was fully qualified to
+  `hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf`, an entire
+  previously-embedded corpus was orphaned and re-read as "pending", forcing a
+  full multi-hour re-embed. Adoption re-embeds one sample, confirms it reproduces
+  the stored vector within a tight cosine-distance threshold, then relabels every
+  matching chunk in place without recomputing. Fails safe: any mismatch leaves
+  the legacy vectors untouched and the re-embed proceeds. The model-alias map and
+  the pure relabel/detection helpers live in the new `src/legacy-embed-adoption.ts`
+  module.
 
 ## [2.5.3] - 2026-05-28
 

@@ -3370,7 +3370,10 @@ describe("Embedding batching", () => {
     }
   });
 
-  test("generateEmbeddings opens a long-lived LLM session for embed runs", async () => {
+  test("generateEmbeddings opens an unbounded LLM session by default (no self-abort)", async () => {
+    // A bulk embed over a large corpus can run for hours. The session used to
+    // hard-cap at 30 minutes and strand the remainder as "session expired"
+    // failures; it now defaults to 0 (no watchdog timer).
     const store = await createTestStore();
     const fakeLlm = createFakeEmbedLlm();
     const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
@@ -3386,9 +3389,38 @@ describe("Embedding batching", () => {
       expect(sessionSpy).toHaveBeenCalledWith(
         fakeLlm,
         expect.any(Function),
-        expect.objectContaining({ maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" }),
+        expect.objectContaining({ maxDuration: 0, name: "generateEmbeddings" }),
       );
     } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings honors QMD_EMBED_MAX_DURATION_MS for a watchdog", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    const previous = process.env.QMD_EMBED_MAX_DURATION_MS;
+    process.env.QMD_EMBED_MAX_DURATION_MS = "60000";
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: 60000, name: "generateEmbeddings" }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.QMD_EMBED_MAX_DURATION_MS;
+      else process.env.QMD_EMBED_MAX_DURATION_MS = previous;
       sessionSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);

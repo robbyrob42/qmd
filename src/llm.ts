@@ -1062,6 +1062,7 @@ export class LlamaCpp implements LLM {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
             contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+            batchSize: LlamaCpp.EMBED_BATCH_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
@@ -1170,6 +1171,21 @@ export class LlamaCpp implements LLM {
   private static readonly EMBED_CONTEXT_SIZE: number = (() => {
     const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
     return Number.isFinite(v) && v > 0 ? v : 2048;
+  })();
+  // Prompt-processing batch size (in tokens) for embedding contexts. Defaults to
+  // the context size so a full-length chunk fits in one batch and several short
+  // chunks can pack together. Raising QMD_EMBED_BATCH_SIZE lets more concurrent
+  // chunks coalesce into a single decode pass (faster) at the cost of memory.
+  private static readonly EMBED_BATCH_SIZE: number = (() => {
+    const v = parseInt(process.env.QMD_EMBED_BATCH_SIZE ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : LlamaCpp.EMBED_CONTEXT_SIZE;
+  })();
+  // How many getEmbeddingFor calls to keep in flight per context. The context's
+  // internal queue coalesces them into shared decode passes; this bounds memory
+  // and in-flight work. Override with QMD_EMBED_CONCURRENCY.
+  private static readonly EMBED_CONCURRENCY: number = (() => {
+    const v = parseInt(process.env.QMD_EMBED_CONCURRENCY ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : 32;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
@@ -1300,8 +1316,63 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Batch embed multiple texts efficiently
-   * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
+   * Embed a list of texts through ONE embedding context, dispatching up to
+   * `concurrency` getEmbeddingFor calls at a time.
+   *
+   * node-llama-cpp's embedding context has an internal queue: concurrent
+   * getEmbeddingFor calls are coalesced and flushed together (up to the
+   * context's batchSize) in a single decode pass. Awaiting each call serially —
+   * as this code used to — defeats that and forces one decode per text. Firing a
+   * window of calls concurrently is what actually lets the GPU batch them.
+   * Results are written back by index so output order matches input order, and
+   * per-text failures resolve to null rather than failing the whole window.
+   *
+   * @param ctx - The embedding context to evaluate against
+   * @param texts - Texts to embed
+   * @param model - Model URI to stamp on results
+   * @param concurrency - Max in-flight getEmbeddingFor calls
+   */
+  private async embedTextsWithContext(
+    ctx: LlamaEmbeddingContext,
+    texts: string[],
+    model: string | undefined,
+    concurrency: number,
+  ): Promise<(EmbeddingResult | null)[]> {
+    const out: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+    const window = Math.max(1, concurrency);
+    for (let start = 0; start < texts.length; start += window) {
+      const end = Math.min(start + window, texts.length);
+      await Promise.all(
+        Array.from({ length: end - start }, (_unused, j) => {
+          const idx = start + j;
+          return (async () => {
+            try {
+              const { text: safeText, truncated, limit } = await this.truncateToContextSize(texts[idx]!);
+              if (truncated) {
+                console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
+              }
+              const embedding = await ctx.getEmbeddingFor(safeText);
+              this.touchActivity();
+              out[idx] = { embedding: Array.from(embedding.vector), model: model ?? this.embedModelUri };
+            } catch (err) {
+              console.error("Embedding error for text:", err);
+              out[idx] = null;
+            }
+          })();
+        }),
+      );
+    }
+    return out;
+  }
+
+  /**
+   * Batch embed multiple texts efficiently.
+   *
+   * Splits the work across all available embedding contexts (cross-context
+   * parallelism) and, within each context, dispatches getEmbeddingFor calls in
+   * concurrent windows so node-llama-cpp can batch them into shared decode
+   * passes (intra-context batching). Both are tunable: QMD_EMBED_CONCURRENCY
+   * sets the per-context window, QMD_EMBED_BATCH_SIZE sets the context batchSize.
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
@@ -1313,54 +1384,24 @@ export class LlamaCpp implements LLM {
     try {
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
+      const concurrency = LlamaCpp.EMBED_CONCURRENCY;
 
       if (n === 1) {
-        // Single context: sequential (no point splitting)
-        const context = contexts[0]!;
-        const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
-        for (const text of texts) {
-          try {
-            const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-            if (truncated) {
-              console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
-            }
-            const embedding = await context.getEmbeddingFor(safeText);
-            this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-          } catch (err) {
-            console.error("Embedding error for text:", err);
-            embeddings.push(null);
-          }
-        }
-        return embeddings;
+        // Single context: no cross-context split, but still batch within it.
+        return await this.embedTextsWithContext(contexts[0]!, texts, options.model, concurrency);
       }
 
-      // Multiple contexts: split texts across contexts for parallel evaluation
+      // Multiple contexts: split texts across contexts for parallel evaluation,
+      // each context batching its own slice concurrently.
       const chunkSize = Math.ceil(texts.length / n);
       const chunks = Array.from({ length: n }, (_, i) =>
         texts.slice(i * chunkSize, (i + 1) * chunkSize)
       );
 
       const chunkResults = await Promise.all(
-        chunks.map(async (chunk, i) => {
-          const ctx = contexts[i]!;
-          const results: (EmbeddingResult | null)[] = [];
-          for (const text of chunk) {
-            try {
-              const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
-              if (truncated) {
-                console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
-              }
-              const embedding = await ctx.getEmbeddingFor(safeText);
-              this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
-            } catch (err) {
-              console.error("Embedding error for text:", err);
-              results.push(null);
-            }
-          }
-          return results;
-        })
+        chunks.map((chunk, i) =>
+          this.embedTextsWithContext(contexts[i]!, chunk, options.model, concurrency)
+        )
       );
 
       return chunkResults.flat();
