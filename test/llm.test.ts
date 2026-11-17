@@ -35,10 +35,13 @@ import {
   canUnloadLLM,
   SessionReleasedError,
   inspectGgufFile,
+  formatDocForEmbedding,
+  EMBED_TITLE_MAX_CHARS,
   type RerankDocument,
   type ILLMSession,
   type RerankResult,
 } from "../src/llm.js";
+import { getEmbeddingFingerprint } from "../src/store.js";
 
 describe("inspectGgufFile", () => {
   let dir: string;
@@ -1525,5 +1528,37 @@ describe("LlamaCpp generate sequence dispose (node-llama-cpp 3.20)", () => {
     } finally {
       setNodeLlamaCppModuleForTest(null);
     }
+  });
+});
+
+// treeFarm fork: title clamp (R-31). A 10,177-character title once flooded
+// every chunk of one document; the clamp keeps the embedded title bounded.
+// See docs/qmd-fork-notes.md in the treeFarm repo.
+describe("formatDocForEmbedding title clamp (treeFarm fork)", () => {
+  const LONG = "x".repeat(10_177);
+  const QWEN = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+  const GEMMA = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+
+  test("clamps a long title to EMBED_TITLE_MAX_CHARS (default branch)", () => {
+    expect(EMBED_TITLE_MAX_CHARS).toBe(256);
+    const out = formatDocForEmbedding("body text", LONG, GEMMA);
+    expect(out).toContain("x".repeat(256));
+    expect(out).not.toContain("x".repeat(257));
+    expect(out).toContain("body text");
+  });
+
+  test("clamps a long title in the Qwen3 branch", () => {
+    const out = formatDocForEmbedding("body text", LONG, QWEN);
+    expect(out).toBe(`${"x".repeat(256)}\nbody text`);
+  });
+
+  test("a title at or under the limit is unchanged", () => {
+    const exact = "y".repeat(256);
+    expect(formatDocForEmbedding("b", exact, GEMMA)).toBe(`title: ${exact} | text: b`);
+    expect(formatDocForEmbedding("b", "A 29-character probe title ok", GEMMA)).toBe("title: A 29-character probe title ok | text: b");
+  });
+
+  test("embedding fingerprint is unchanged by the clamp", () => {
+    expect(getEmbeddingFingerprint()).toBe("c37385");
   });
 });

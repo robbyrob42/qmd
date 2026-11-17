@@ -112,7 +112,18 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Uses nomic-style format with title and text fields (default).
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
-export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+/**
+ * treeFarm fork: longest title, in characters, placed in an embedding input.
+ * A 10,177-character title once filled every chunk of one document, so the
+ * chunk text barely reached the model. Assumption: 256 characters is longer
+ * than any real title and longer than the fingerprint probe title (29), so the
+ * embedding fingerprint does not change. See docs/qmd-fork-notes.md in treeFarm.
+ */
+export const EMBED_TITLE_MAX_CHARS = 256;
+
+export function formatDocForEmbedding(text: string, rawTitle?: string, modelUri?: string): string {
+  // Char-based clamp, applied once so every branch below gets the same title.
+  const title = rawTitle && rawTitle.length > EMBED_TITLE_MAX_CHARS ? rawTitle.slice(0, EMBED_TITLE_MAX_CHARS) : rawTitle;
   const uri = modelUri ?? resolveEmbedModel();
   if (uri.startsWith("remote-openai:") || isRemoteEmbedModel(uri)) return title ? `${title}\n${text}` : text;
   if (isQwen3EmbeddingModel(uri)) {
